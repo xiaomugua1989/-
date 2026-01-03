@@ -1,0 +1,151 @@
+# 工作流名称：可自定义，方便在Actions中识别
+name: 动态水位监测（Playwright+微信推送）
+# 触发条件：每3分钟自动运行 + 手动触发（方便测试）
+on:
+  schedule:
+    - cron: '*/3 * * * *'  # 每3分钟运行1次（cron表达式，无需修改）
+  workflow_dispatch:  # 开启手动触发，方便快速验证结果
+
+# 执行任务：单任务ubuntu环境运行
+jobs:
+  scrape-dynamic-water-level:
+    runs-on: ubuntu-latest  # 运行环境：GitHub免费提供的ubuntu服务器
+    steps:
+      # 步骤1：拉取当前仓库代码（用于读写历史水位数据，实现变动对比）
+      - name: 拉取仓库代码
+        uses: actions/checkout@v4
+
+      # 步骤2：安装Node.js环境（Playwright是Node.js库，必须先安装Node）
+      - name: 配置Node.js 18.x环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'  # 固定Node版本，避免兼容性问题
+
+      # 步骤3：安装Playwright及Chrome浏览器依赖（自动安装，无需手动操作）
+      - name: 安装Playwright和浏览器驱动
+        run: |
+          # 初始化npm项目（生成package.json，无需手动配置）
+          npm init -y
+          # 安装最新版Playwright
+          npm install playwright@latest
+          # 安装Chrome浏览器（Playwright模拟真实浏览器的核心）
+          npx playwright install chromium
+          # 安装浏览器系统依赖（解决ubuntu环境下的运行报错）
+          npx playwright install-deps chromium
+
+      # 步骤4：创建Playwright抓取脚本（核心：模拟浏览器抓取动态水位）
+      - name: 写入Playwright抓取脚本
+        run: |
+          # 创建scrape.js文件，并写入抓取逻辑
+          cat > scrape.js << 'EOF'
+          // 引入Playwright的chromium浏览器模块
+          const { chromium } = require('playwright');
+          // 引入文件操作模块（用于保存当前水位数据）
+          const fs = require('fs');
+
+          // 核心抓取函数：异步执行，避免阻塞
+          (async () => {
+            // ---------------------- 需替换项1：目标网页URL ----------------------
+            // 替换为你要监测的水位所在网页（如雷速体育某场赛事的详情页URL）
+            const TARGET_WEBPAGE_URL = "https://hga050.com/";
+            
+            // ---------------------- 需替换项2：水位元素定位（XPath） ----------------------
+            // 替换为你抓取的水位XPath（可先用临时XPath快速落地，后续替换为稳定XPath）
+            // 注意：XPath中的双引号"要转义为\"，避免脚本语法报错
+            const WATER_LEVEL_XPATH = "//*[@id=\"bet_8413021_10280644_RH\"]/span[2]";
+            
+            // 1. 启动Chrome浏览器（无头模式：无可视化界面，适配云端运行）
+            const browser = await chromium.launch({
+              headless: true,  // 关闭可视化，云端运行必须开启
+              args: ['--no-sandbox', '--disable-setuid-sandbox']  // 解决ubuntu环境权限问题
+            });
+            
+            // 2. 新建浏览器标签页，访问目标网页
+            const page = await browser.newPage();
+            try {
+              // 访问目标网页：等待网络空闲（确保动态JS数据加载完成）
+              await page.goto(TARGET_WEBPAGE_URL, {
+                waitUntil: 'networkidle',  // 等待网络请求停止（动态数据加载完毕）
+                timeout: 30000  // 超时时间：30秒（避免网页加载过慢导致失败）
+              });
+              
+              // 额外等待2秒：确保水位数据完全渲染（部分网页JS加载延迟）
+              await page.waitForTimeout(2000);
+              
+              // 3. 定位水位元素，抓取数值
+              const waterLevelLocator = page.locator(WATER_LEVEL_XPATH);
+              // 等待元素加载（超时5秒，避免元素未渲染导致抓取失败）
+              await waterLevelLocator.waitFor({ timeout: 5000 });
+              // 获取水位文本内容（去除前后空格）
+              const currentWaterLevel = (await waterLevelLocator.textContent()).trim() || "未抓取到数据";
+              
+              // 4. 整理抓取结果，保存为JSON文件（方便后续对比）
+              const scrapeResult = {
+                抓取时间: new Date().toLocaleString("zh-CN"),  // 格式化时间，方便查看
+                当前水位: currentWaterLevel,
+                赛事页面: TARGET_WEBPAGE_URL
+              };
+              
+              // 保存当前结果到文件
+              fs.writeFileSync(
+                'current_water_level.json',
+                JSON.stringify(scrapeResult, null, 2),  // 格式化JSON，可读性更强
+                'utf-8'
+              );
+              
+              console.log("抓取成功！结果：", scrapeResult);
+            } catch (error) {
+              // 抓取失败：记录错误信息，避免工作流直接中断
+              const errorResult = {
+                抓取时间: new Date().toLocaleString("zh-CN"),
+                错误信息: error.message,
+                状态: "抓取失败"
+              };
+              fs.writeFileSync(
+                'current_water_level.json',
+                JSON.stringify(errorResult, null, 2),
+                'utf-8'
+              );
+              console.error("抓取失败：", error.message);
+            } finally {
+              // 5. 关闭浏览器，释放资源
+              await browser.close();
+            }
+          })();
+          EOF
+
+      # 步骤5：运行Playwright抓取脚本，获取当前水位
+      - name: 执行抓取脚本，获取动态水位
+        run: node scrape.js
+
+      # 步骤6：对比当前水位与历史水位，变动则推送微信（Server酱）
+      - name: 数据对比并推送微信提醒
+        run: |
+          # 1. 读取当前水位数据和历史水位数据（首次运行为空，不报错）
+          CURRENT_DATA=$(cat current_water_level.json 2>/dev/null || echo '{"状态":"无历史数据"}')
+          LAST_DATA=$(cat last_water_level.json 2>/dev/null || echo '{"状态":"无历史数据"}')
+
+          # 2. 判断数据是否变动（排除抓取失败和无历史数据的情况）
+          if [ "$CURRENT_DATA" != "$LAST_DATA" ] && [[ "$CURRENT_DATA" != *"抓取失败"* ]] && [[ "$CURRENT_DATA" != *"未抓取到数据"* ]]; then
+            # ---------------------- 需替换项3：Server酱SendKey ----------------------
+            # 替换为你的Server酱SendKey（获取地址：https://sct.ftqq.com/）
+            SERVER_CHAN_SEND_KEY="SCT307241Tv8tvBfJ9uEQYKcyWtguOE3nt"
+            
+            # 3. 构造推送内容，调用Server酱API推送微信
+            curl -X POST "https://sctapi.ftqq.com/${SERVER_CHAN_SEND_KEY}.send" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -d "title=【赛事水位变动提醒】" \
+              -d "desp=### 抓取结果\n$(echo $CURRENT_DATA | jq -r '.[]' | awk '{print "- " $0}')"
+            
+            # 4. 更新历史水位数据（保存当前数据为下次对比的历史数据）
+            cp current_water_level.json last_water_level.json
+            
+            # 5. 提交历史数据到GitHub仓库（确保下次运行能获取到历史数据）
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@noreply.github.com"
+            git add last_water_level.json
+            git commit -m "更新水位历史数据：$(date +'%Y-%m-%d %H:%M:%S')"
+            git push
+          else
+            echo "水位无变动或抓取失败，无需推送微信"
+          fi
